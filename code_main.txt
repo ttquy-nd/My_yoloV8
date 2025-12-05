@@ -1,0 +1,233 @@
+from flask import Flask, Response
+import cv2
+import numpy as np
+import torch
+import time
+import requests
+import json
+
+from ultralytics import YOLO
+
+app = Flask(__name__)
+
+# ============================
+# Camera 1 – TAPO
+# ============================
+CAM1_URL = "http://192.168.137.242:8080/video/tapo"
+TB1_TOKEN = "uHSL8BOYAORjp9rZMX3s"
+TB1_URL = f"http://thingsboard.cloud/api/v1/{TB1_TOKEN}/telemetry"
+
+# ============================
+# Camera 2 – ESP32
+# ============================
+CAM2_URL = "http://192.168.137.242:8080/video/esp32"
+TB2_TOKEN = "S30kVe4YBpocPSkkm2OV"
+TB2_URL = f"http://thingsboard.cloud/api/v1/{TB2_TOKEN}/telemetry"
+
+# Load YOLOv8s
+model = YOLO("yolov8s.pt")
+model.to("cpu")
+
+# Class xe COCO
+VEHICLE_CLASS_IDS = [1, 2, 3, 5, 7]
+
+# Config
+PIXEL_TO_METER = 0.12
+CONF_THRES = 0.15
+DETECT_INTERVAL = 5
+SEND_INTERVAL = 120
+
+
+# ==============================================
+# HÀM GỬI DỮ LIỆU THINGSBOARD
+# ==============================================
+def send_to_tb(url, veh, dens, speed, lv):
+    payload = {
+        "vehicle_count": veh,
+        "density": dens,
+        "avg_speed": speed,
+        "level": lv
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=3)
+        print(f"📡 Sent to TB: {url} | Status: {r.status_code}")
+    except Exception as e:
+        print("❌ TB ERROR:", e)
+
+
+def classify_traffic(density):
+    if density <= 0.05:
+        return 1
+    if density < 0.35:
+        return 2
+    elif density < 0.7:
+        return 3
+    return 3
+
+
+# ==============================================
+# MODULE XỬ LÝ CHUNG CHO TỪNG CAMERA
+# ==============================================
+def process_camera_stream(cam_url, tb_url, camera_name):
+
+    cap = cv2.VideoCapture(cam_url)
+
+    if not cap.isOpened():
+        print(f"❌ Không mở được {camera_name}")
+        return
+
+    print(f"📡 Connected {camera_name}")
+
+    # Biến riêng cho từng camera
+    prev_positions = {}
+    prev_time = None
+    last_detect_time = 0
+    last_send_time = 0
+    density = 0
+    avg_speed = 0
+    vehicle_count = 0
+    level = 1
+    last_boxes = []
+
+    # ROI riêng theo camera (bạn chỉnh tùy ý)
+    # Camera TAPO hoặc ESP32 cùng ROI thì giữ như cũ
+    roi_x1, roi_y1 = 200, 100
+    roi_x2, roi_y2 = 600, 300
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print(f"⚠ Mất kết nối {camera_name}, thử lại...")
+            cap = cv2.VideoCapture(cam_url)
+            continue
+
+        small = cv2.resize(frame, (640, 360))
+        roi = small[roi_y1:roi_y2, roi_x1:roi_x2]
+
+        now = time.time()
+
+        # ============================
+        # DETECT mỗi 5 giây
+        # ============================
+        if now - last_detect_time >= DETECT_INTERVAL:
+            last_detect_time = now
+
+            last_boxes = []
+            curr_positions = {}
+            vehicle_area = 0
+            vehicle_count = 0
+
+            with torch.no_grad():
+                results = model.predict(
+                    roi, conf=CONF_THRES, imgsz=416,
+                    classes=VEHICLE_CLASS_IDS, verbose=False
+                )[0]
+
+            ROI_area = roi.shape[0] * roi.shape[1]
+
+            for idx, box in enumerate(results.boxes):
+
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+                # map to full frame
+                x1 += roi_x1; x2 += roi_x1
+                y1 += roi_y1; y2 += roi_y1
+
+                last_boxes.append((x1, y1, x2, y2))
+
+                vehicle_count += 1
+                vehicle_area += (x2 - x1) * (y2 - y1)
+
+                cx = (x1 + x2)//2
+                cy = (y1 + y2)//2
+                curr_positions[idx] = (cx, cy)
+
+            # Calculate density
+            density = min(vehicle_area / ROI_area, 1.0)
+
+            # SPEED tính theo 5 giây
+            if prev_time is not None:
+                dt = now - prev_time
+                speeds = []
+                for vid, (cx2, cy2) in curr_positions.items():
+                    if vid in prev_positions:
+                        cx1, cy1 = prev_positions[vid]
+                        pix = np.sqrt((cx2-cx1)**2 + (cy2-cy1)**2)
+                        meter = pix * PIXEL_TO_METER
+                        speed = meter / dt
+                        speeds.append(speed)
+                avg_speed = np.mean(speeds) if speeds else 0
+
+            prev_positions = curr_positions
+            prev_time = now
+
+            level = classify_traffic(density)
+
+        # ============================
+        # GỬI THINGSBOARD mỗi 120 giây
+        # ============================
+        if now - last_send_time >= SEND_INTERVAL:
+            last_send_time = now
+            send_to_tb(tb_url, vehicle_count, density, avg_speed, level)
+
+        # ============================
+        # VẼ BOX
+        # ============================
+        for (x1, y1, x2, y2) in last_boxes:
+            cv2.rectangle(small, (x1, y1), (x2, y2), (0,255,0), 2)
+
+        cv2.rectangle(small, (roi_x1, roi_y1), (roi_x2, roi_y2), (255,0,0), 2)
+
+        cv2.putText(small, f"{camera_name}", (10,25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9,(0,255,255),2)
+
+        cv2.putText(small, f"Veh: {vehicle_count}", (20,50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,0),2)
+
+        cv2.putText(small, f"Dens: {density:.2f}", (20,80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,255),2)
+
+        cv2.putText(small, f"Speed: {avg_speed:.2f}", (20,110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,(255,255,0),2)
+
+        cv2.putText(small, f"Level: {level}", (20,140),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,(255,0,255),2)
+
+        ret, jpeg = cv2.imencode('.jpg', small)
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+               jpeg.tobytes() + b"\r\n")
+
+
+# ============================
+# FLASK STREAM
+# ============================
+
+@app.route("/")
+def home():
+    return """
+    <h2>YOLOv8 Dual Camera</h2>
+    <ul>
+        <li><a href='/video1'>Camera TAPO</a></li>
+        <li><a href='/video2'>Camera ESP32</a></li>
+    </ul>
+    """
+
+
+@app.route("/video1")
+def video1():
+    return Response(process_camera_stream(CAM1_URL, TB1_URL, "TAPO"),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/video2")
+def video2():
+    return Response(process_camera_stream(CAM2_URL, TB2_URL, "ESP32"),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+# ============================
+# MAIN
+# ============================
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, threaded=True)

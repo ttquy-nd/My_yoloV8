@@ -1,0 +1,198 @@
+from flask import Flask, Response
+import cv2
+import numpy as np
+import torch
+import time
+import requests
+from ultralytics import YOLO
+
+app = Flask(__name__)
+
+# =====================================================
+# Load YOLOv8s
+# =====================================================
+model = YOLO("yolov8s.pt")
+model.to("cpu")
+
+# =====================================================
+# ThingsBoard Cloud
+# =====================================================
+TB1_TOKEN = "uHSL8BOYAORjp9rZMX3s"
+TB1_URL = f"http://thingsboard.cloud/api/v1/{TB1_TOKEN}/telemetry"
+
+def send_to_thingsboard(veh, dens, speed, lv):
+    payload = {
+        "vehicle_count": veh,
+        "density": dens,
+        "avg_speed": speed,
+        "level": lv
+    }
+    try:
+        r = requests.post(TB1_URL, json=payload, timeout=4)
+        print("📡 Sent to ThingsBoard:", r.status_code)
+    except Exception as e:
+        print("❌ TB ERROR:", e)
+
+
+# =====================================================
+# Class filter
+# =====================================================
+VEHICLE_CLASS_IDS = [1, 2, 3, 5, 7]  
+PIXEL_TO_METER = 0.12
+CONF_THRES = 0.05
+
+# Thời gian detect & gửi dữ liệu
+DETECT_INTERVAL = 5       # detect 5s/lần
+SEND_INTERVAL = 120       # gửi ThingsBoard 2 phút/lần
+
+prev_positions = {}
+prev_time = None
+
+
+def classify_traffic(density):
+    if density <= 0.05:
+        return 1
+    if density < 0.35:
+        return 1
+    elif density < 0.7:
+        return 2
+    return 3
+
+
+def generate(video_path):
+    global prev_positions, prev_time
+    
+    cap = cv2.VideoCapture(video_path)
+
+    density = 0
+    avg_speed = 0
+    vehicle_count = 0
+    level = 1
+    
+    last_detect = 0
+    last_send = 0
+
+    last_boxes = []
+
+    print("Stream started...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+
+        small = cv2.resize(frame, (640, 360))
+
+        roi_x1, roi_y1 = 200, 100
+        roi_x2, roi_y2 = 600, 300
+        roi = small[roi_y1:roi_y2, roi_x1:roi_x2]
+
+        now = time.time()
+
+        # =====================================================
+        # DETECT mỗi 5 giây
+        # =====================================================
+        if now - last_detect >= DETECT_INTERVAL:
+            last_detect = now
+            last_boxes = []
+            curr_positions = {}
+            vehicle_area = 0
+            vehicle_count = 0
+
+            with torch.no_grad():
+                results = model.predict(
+                    roi,
+                    conf=CONF_THRES,
+                    imgsz=416,
+                    classes=VEHICLE_CLASS_IDS,
+                    verbose=False
+                )[0]
+
+            ROI_area = roi.shape[0] * roi.shape[1]
+
+            for idx, box in enumerate(results.boxes):
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+                x1 += roi_x1; x2 += roi_x1
+                y1 += roi_y1; y2 += roi_y1
+
+                last_boxes.append((x1, y1, x2, y2))
+
+                vehicle_count += 1
+                vehicle_area += (x2 - x1) * (y2 - y1)
+
+                cx = (x1 + x2)//2
+                cy = (y1 + y2)//2
+                curr_positions[idx] = (cx, cy)
+
+            density = min(vehicle_area / ROI_area, 1.0)
+
+            # SPEED 5s
+            if prev_time is not None:
+                dt = now - prev_time
+                speeds = []
+                for vid, (cx2, cy2) in curr_positions.items():
+                    if vid in prev_positions:
+                        cx1, cy1 = prev_positions[vid]
+                        pix = np.sqrt((cx2-cx1)**2 + (cy2-cy1)**2)
+                        meter = pix * PIXEL_TO_METER
+                        speed = meter / dt
+                        speeds.append(speed)
+                avg_speed = float(np.mean(speeds)) if speeds else 0
+
+            prev_positions = curr_positions
+            prev_time = now
+
+            level = classify_traffic(density)
+
+        # =====================================================
+        # Gửi dữ liệu ThingsBoard mỗi 120 giây
+        # =====================================================
+        if now - last_send >= SEND_INTERVAL:
+            last_send = now
+            send_to_thingsboard(vehicle_count, density, avg_speed, level)
+
+        # Draw boxes
+        for (x1,y1,x2,y2) in last_boxes:
+            cv2.rectangle(small, (x1,y1), (x2,y2), (0,255,0), 2)
+
+        cv2.rectangle(small, (roi_x1, roi_y1), (roi_x2, roi_y2), (255,0,0), 2)
+
+        cv2.putText(small, f"Veh: {vehicle_count}", (20,40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,0),2)
+
+        cv2.putText(small, f"Dens: {density:.2f}", (20,70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,(0,255,255),2)
+
+        cv2.putText(small, f"Speed: {avg_speed:.2f}", (20,100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,(255,255,0),2)
+
+        cv2.putText(small, f"Level: {level}", (20,130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,(255,0,255),2)
+
+        ret, jpeg = cv2.imencode('.jpg', small)
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
+               jpeg.tobytes() + b"\r\n")
+
+
+# =====================================================
+# FLASK ROUTES
+# =====================================================
+
+@app.route("/")
+def home():
+    return "<h2>YOLOv8 Traffic Monitor (Video + ThingsBoard)</h2><img src='/video'>"
+
+
+@app.route("/video")
+def video():
+    return Response(generate("tf.mp4"),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+# =====================================================
+# MAIN
+# =====================================================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, threaded=True)
